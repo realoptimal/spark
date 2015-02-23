@@ -48,6 +48,7 @@ private[spark] class CoarseMesosSchedulerBackend(
     sc: SparkContext,
     master: String)
   extends CoarseGrainedSchedulerBackend(scheduler, sc.env.actorSystem)
+  with MesosSchedulerUtils
   with MScheduler
   with Logging {
 
@@ -92,13 +93,11 @@ private[spark] class CoarseMesosSchedulerBackend(
       new Thread("CoarseMesosSchedulerBackend driver") {
         setDaemon(true)
         override def run() {
-          val scheduler = CoarseMesosSchedulerBackend.this
-          val fwInfo = FrameworkInfo.newBuilder().setUser(sc.sparkUser).setName(sc.appName).build()
-          driver = new MesosSchedulerDriver(scheduler, fwInfo, master)
-          try { {
+          driver = createSchedulerDriver(
+            CoarseMesosSchedulerBackend.this, sc.sparkUser, sc.appName, master, sc.conf)
+          try {
             val ret = driver.run()
             logInfo("driver.run() returned with code " + ret)
-          }
           } catch {
             case e: Exception => logError("driver.run() failed", e)
           }
