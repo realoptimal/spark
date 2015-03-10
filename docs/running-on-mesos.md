@@ -234,6 +234,28 @@ See the [configuration page](configuration.html) for information on Spark config
     `spark.mesos.executor.memoryOverhead` or 7% of `spark.executor.memory`.
   </td>
 </tr>
+<tr>
+  <td><code>spark.mesos.principal</code></td>
+  <td>Framework principal to authenticate to Mesos</td>
+  <td>
+    Set the principal in which Spark framework will use to authenticate with Mesos.
+  </td>
+</tr>
+<tr>
+  <td><code>spark.mesos.secret</code></td>
+  <td>Framework secret to authenticate to Mesos</td>
+  <td>
+    Set the secret in which Spark framework will use to authenticate with Mesos.
+  </td>
+</tr>
+<tr>
+  <td><code>spark.mesos.role</code></td>
+  <td>Role for the Spark framework</td>
+  <td>
+    Set the role of this Spark framework for Mesos. Roles are used in Mesos for reservations
+    and resource weigth sharing.
+  </td>
+</tr>
 </table>
 
 # Troubleshooting and Debugging
