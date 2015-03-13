@@ -135,11 +135,16 @@ private[spark] class MesosSchedulerBackend(
       command.setValue(s"cd ${basename}*; $prefixEnv ./bin/spark-class $executorBackendName")
       command.addUris(CommandInfo.URI.newBuilder().setValue(uri))
     }
+    val frameworkRole = sc.conf.get("spark.mesos.role", null)
+    if (frameworkRole != null) {
+      logInfo(s"Executor Spark role `spark.mesos.role`: " + frameworkRole)
+    }
     val cpus = Resource.newBuilder()
       .setName("cpus")
       .setType(Value.Type.SCALAR)
       .setScalar(Value.Scalar.newBuilder()
         .setValue(scheduler.CPUS_PER_TASK).build())
+      .setRole(frameworkRole)
       .build()
     val memory = Resource.newBuilder()
       .setName("mem")
@@ -147,6 +152,7 @@ private[spark] class MesosSchedulerBackend(
       .setScalar(
         Value.Scalar.newBuilder()
           .setValue(MemoryUtils.calculateTotalMemory(sc)).build())
+      .setRole(frameworkRole)
       .build()
     MesosExecutorInfo.newBuilder()
       .setExecutorId(ExecutorID.newBuilder().setValue(execId).build())
@@ -178,7 +184,7 @@ private[spark] class MesosSchedulerBackend(
   override def registered(d: SchedulerDriver, frameworkId: FrameworkID, masterInfo: MasterInfo) {
     inClassLoader() {
       appId = frameworkId.getValue
-      logInfo("Registered as framework ID " + appId)
+      logInfo("Registered as framework ID " + appId + " with master " + masterInfo)
       registeredLock.synchronized {
         isRegistered = true
         registeredLock.notifyAll()
@@ -237,12 +243,15 @@ private[spark] class MesosSchedulerBackend(
           getResource(o.getResourcesList, "cpus").toInt -
             scheduler.CPUS_PER_TASK
         }
+        
         new WorkerOffer(
           o.getSlaveId.getValue,
           o.getHostname,
           cpus)
       }
 
+      val fwRole = sc.conf.get("spark.mesos.role", null)
+      
       val slaveIdToOffer = usableOffers.map(o => o.getSlaveId.getValue -> o).toMap
       val slaveIdToWorkerOffer = workerOffers.map(o => o.executorId -> o).toMap
 
@@ -260,7 +269,7 @@ private[spark] class MesosSchedulerBackend(
             slavesIdsOfAcceptedOffers += slaveId
             taskIdToSlaveId(taskDesc.taskId) = slaveId
             mesosTasks.getOrElseUpdate(slaveId, new JArrayList[MesosTaskInfo])
-              .add(createMesosTask(taskDesc, slaveId))
+              .add(createMesosTask(taskDesc, slaveId, fwRole))
           }
         }
 
@@ -296,12 +305,13 @@ private[spark] class MesosSchedulerBackend(
   }
 
   /** Turn a Spark TaskDescription into a Mesos task */
-  def createMesosTask(task: TaskDescription, slaveId: String): MesosTaskInfo = {
+  def createMesosTask(task: TaskDescription, slaveId: String, role: String): MesosTaskInfo = {
     val taskId = TaskID.newBuilder().setValue(task.taskId.toString).build()
     val cpuResource = Resource.newBuilder()
       .setName("cpus")
       .setType(Value.Type.SCALAR)
       .setScalar(Value.Scalar.newBuilder().setValue(scheduler.CPUS_PER_TASK).build())
+      .setRole(role)
       .build()
     MesosTaskInfo.newBuilder()
       .setTaskId(taskId)
