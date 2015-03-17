@@ -206,12 +206,14 @@ private[spark] class CoarseMesosSchedulerBackend(
    */
   override def resourceOffers(d: SchedulerDriver, offers: JList[Offer]) {
     synchronized {
+      val expectedRole = sc.conf.get("mesos.spark.role", "*")
+      
       val filters = Filters.newBuilder().setRefuseSeconds(-1).build()
 
       for (offer <- offers) {
         val slaveId = offer.getSlaveId.toString
-        val mem = getResource(offer.getResourcesList, "mem")
-        val cpus = getResource(offer.getResourcesList, "cpus").toInt
+        val mem = getResource(offer.getResourcesList, "mem", expectedRole)
+        val cpus = getResource(offer.getResourcesList, "cpus", expectedRole).toInt
         if (totalCoresAcquired < maxCores &&
             mem >= MemoryUtils.calculateTotalMemory(sc) &&
             cpus >= 1 &&
@@ -229,9 +231,9 @@ private[spark] class CoarseMesosSchedulerBackend(
             .setSlaveId(offer.getSlaveId)
             .setCommand(createCommand(offer, cpusToUse + extraCoresPerSlave))
             .setName("Task " + taskId)
-            .addResources(createResource("cpus", cpusToUse))
+            .addResources(createResource("cpus", cpusToUse, expectedRole))
             .addResources(createResource("mem",
-              MemoryUtils.calculateTotalMemory(sc)))
+              MemoryUtils.calculateTotalMemory(sc), expectedRole))
             .build()
           d.launchTasks(
             Collections.singleton(offer.getId),  Collections.singletonList(task), filters)
@@ -245,19 +247,20 @@ private[spark] class CoarseMesosSchedulerBackend(
   }
 
   /** Helper function to pull out a resource from a Mesos Resources protobuf */
-  private def getResource(res: JList[Resource], name: String): Double = {
-    for (r <- res if r.getName == name) {
+  private def getResource(res: JList[Resource], name: String, role: String): Double = {
+    for (r <- res if r.getName == name && r.getRole == role) {
       return r.getScalar.getValue
     }
     0
   }
 
   /** Build a Mesos resource protobuf object */
-  private def createResource(resourceName: String, quantity: Double): Protos.Resource = {
+  private def createResource(resourceName: String, quantity: Double, role: String): Protos.Resource = {
     Resource.newBuilder()
       .setName(resourceName)
       .setType(Value.Type.SCALAR)
       .setScalar(Value.Scalar.newBuilder().setValue(quantity).build())
+      .setRole(role)
       .build()
   }
 

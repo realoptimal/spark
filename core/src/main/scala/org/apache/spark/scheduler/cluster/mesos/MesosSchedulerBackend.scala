@@ -135,16 +135,12 @@ private[spark] class MesosSchedulerBackend(
       command.setValue(s"cd ${basename}*; $prefixEnv ./bin/spark-class $executorBackendName")
       command.addUris(CommandInfo.URI.newBuilder().setValue(uri))
     }
-    val frameworkRole = sc.conf.get("spark.mesos.role", null)
-    if (frameworkRole != null) {
-      logInfo(s"Executor Spark role `spark.mesos.role`: " + frameworkRole)
-    }
+    
     val cpus = Resource.newBuilder()
       .setName("cpus")
       .setType(Value.Type.SCALAR)
       .setScalar(Value.Scalar.newBuilder()
         .setValue(scheduler.CPUS_PER_TASK).build())
-      .setRole(frameworkRole)
       .build()
     val memory = Resource.newBuilder()
       .setName("mem")
@@ -152,7 +148,6 @@ private[spark] class MesosSchedulerBackend(
       .setScalar(
         Value.Scalar.newBuilder()
           .setValue(MemoryUtils.calculateTotalMemory(sc)).build())
-      .setRole(frameworkRole)
       .build()
     MesosExecutorInfo.newBuilder()
       .setExecutorId(ExecutorID.newBuilder().setValue(execId).build())
@@ -221,6 +216,9 @@ private[spark] class MesosSchedulerBackend(
    */
   override def resourceOffers(d: SchedulerDriver, offers: JList[Offer]) {
     inClassLoader() {
+      // Expected framework role
+      val reservedRole = sc.conf.get("spark.mesos.role", "*")
+      
       // Fail-fast on offers we know will be rejected
       val (usableOffers, unUsableOffers) = offers.partition { o =>
         val mem = getResource(o.getResourcesList, "mem")
@@ -234,7 +232,14 @@ private[spark] class MesosSchedulerBackend(
             cpus >= scheduler.CPUS_PER_TASK)
       }
 
-      val workerOffers = usableOffers.map { o =>
+      val (reservedUsableOffers, unreservedUsableOffers) = usableOffers.partition { o =>
+        val cpuRole = getResourceRole(o.getResourcesList, "cpus")
+        (cpuRole == "*")
+      }
+      
+      // TODO: reservedUsableOffers.filter(match role)
+      
+      val reservedWorkerOffers = reservedUsableOffers.map { o =>
         val cpus = if (slaveIdsWithExecutors.contains(o.getSlaveId.getValue)) {
           getResource(o.getResourcesList, "cpus").toInt
         } else {
@@ -248,20 +253,38 @@ private[spark] class MesosSchedulerBackend(
           o.getSlaveId.getValue,
           o.getHostname,
           cpus)
+          
       }
-
-      val fwRole = sc.conf.get("spark.mesos.role", null)
+      
+      val unreservedWorkerOffers = unreservedUsableOffers.map { o =>
+        val cpus = if (slaveIdsWithExecutors.contains(o.getSlaveId.getValue)) {
+          getResource(o.getResourcesList, "cpus").toInt
+        } else {
+          // If the executor doesn't exist yet, subtract CPU for executor
+          // TODO(pwendell): Should below just subtract "1"?
+          getResource(o.getResourcesList, "cpus").toInt -
+            scheduler.CPUS_PER_TASK
+        }
+        
+        new WorkerOffer(
+          o.getSlaveId.getValue,
+          o.getHostname,
+          cpus)
+          
+      }      
       
       val slaveIdToOffer = usableOffers.map(o => o.getSlaveId.getValue -> o).toMap
-      val slaveIdToWorkerOffer = workerOffers.map(o => o.executorId -> o).toMap
-
+      val slaveIdToReservedWorkerOffer = reservedWorkerOffers.map(o => o.executorId -> o).toMap
+      val slaveIdToUnreservedWorkerOffer = unreservedWorkerOffers.map(o => o.executorId -> o).toMap
+      
       val mesosTasks = new HashMap[String, JArrayList[MesosTaskInfo]]
 
       val slavesIdsOfAcceptedOffers = HashSet[String]()
 
       // Call into the TaskSchedulerImpl
-      val acceptedOffers = scheduler.resourceOffers(workerOffers).filter(!_.isEmpty)
-      acceptedOffers
+      val acceptedReservedOffers = scheduler.resourceOffers(
+          reservedWorkerOffers).filter(!_.isEmpty)
+      acceptedReservedOffers
         .foreach { offer =>
           offer.foreach { taskDesc =>
             val slaveId = taskDesc.executorId
@@ -269,7 +292,22 @@ private[spark] class MesosSchedulerBackend(
             slavesIdsOfAcceptedOffers += slaveId
             taskIdToSlaveId(taskDesc.taskId) = slaveId
             mesosTasks.getOrElseUpdate(slaveId, new JArrayList[MesosTaskInfo])
-              .add(createMesosTask(taskDesc, slaveId, fwRole))
+              .add(createMesosTask(taskDesc, slaveId, reservedRole))
+          }
+        }
+        
+      // Call into the TaskSchedulerImpl
+      val acceptedUnreservedOffers = scheduler.resourceOffers(
+          unreservedWorkerOffers).filter(!_.isEmpty)
+      acceptedUnreservedOffers
+        .foreach { offer =>
+          offer.foreach { taskDesc =>
+            val slaveId = taskDesc.executorId
+            slaveIdsWithExecutors += slaveId
+            slavesIdsOfAcceptedOffers += slaveId
+            taskIdToSlaveId(taskDesc.taskId) = slaveId
+            mesosTasks.getOrElseUpdate(slaveId, new JArrayList[MesosTaskInfo])
+              .add(createMesosTask(taskDesc, slaveId, "*"))
           }
         }
 
@@ -277,7 +315,12 @@ private[spark] class MesosSchedulerBackend(
       val filters = Filters.newBuilder().setRefuseSeconds(1).build() // TODO: lower timeout?
 
       mesosTasks.foreach { case (slaveId, tasks) =>
-        slaveIdToWorkerOffer.get(slaveId).foreach(o =>
+        slaveIdToReservedWorkerOffer.get(slaveId).foreach(o =>
+          listenerBus.post(SparkListenerExecutorAdded(System.currentTimeMillis(), slaveId,
+            // TODO: Add support for log urls for Mesos
+            new ExecutorInfo(o.host, o.cores, Map.empty)))
+        )
+        slaveIdToUnreservedWorkerOffer.get(slaveId).foreach(o =>
           listenerBus.post(SparkListenerExecutorAdded(System.currentTimeMillis(), slaveId,
             // TODO: Add support for log urls for Mesos
             new ExecutorInfo(o.host, o.cores, Map.empty)))
@@ -296,6 +339,14 @@ private[spark] class MesosSchedulerBackend(
     }
   }
 
+  /** Helper function to pull out a resource role from a mesos Resources protobuf */
+  def getResourceRole(res: JList[Resource], name: String): String = {
+    for (r <- res if r.getName == name) {
+      return r.getRole
+    }
+    "*"
+  }
+  
   /** Helper function to pull out a resource from a Mesos Resources protobuf */
   def getResource(res: JList[Resource], name: String): Double = {
     for (r <- res if r.getName == name) {
