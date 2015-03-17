@@ -17,12 +17,19 @@
 
 package org.apache.spark.scheduler.cluster.mesos
 
-import org.apache.mesos.Protos.{Credential, FrameworkInfo}
-import org.apache.mesos.{Scheduler, MesosSchedulerDriver}
-import org.apache.spark.SparkConf
-import org.apache.mesos.protobuf.ByteString
+import java.util.List
 
-private[spark] trait MesosSchedulerUtils {
+import scala.collection.JavaConversions._
+import scala.collection.mutable.ArrayBuffer
+
+import org.apache.mesos.Protos._
+import org.apache.mesos.{Scheduler, MesosSchedulerDriver}
+import org.apache.spark.{Logging, SparkConf}
+import org.apache.mesos.protobuf.ByteString
+import org.apache.mesos.Protos.Value.Type
+
+
+private[spark] trait MesosSchedulerUtils extends Logging {
   def createSchedulerDriver(
       scheduler: Scheduler,
       sparkUser: String,
@@ -52,5 +59,58 @@ private[spark] trait MesosSchedulerUtils {
     } else {
       new MesosSchedulerDriver(scheduler, fwInfoBuilder.build, masterUrl)
     }
+  }
+
+  // Helper function to pull out a resource from a Mesos Resources protobuf
+  def getResource(res: List[Resource], name: String): Double = {
+    var resource = 0.0
+    // A resource can have multiple values in the offer since it can either be from
+    // a specific role or wildcard.
+    for (r <- res if r.getName == name) {
+      resource += r.getScalar.getValue
+
+    }
+    resource
+  }
+
+  /**
+   * Partition the existing resource list based on the resources requested and
+   * the remaining resources.
+   * @return The remaining resources list and the used resources list.
+   */
+  def partitionResources(
+      resources: List[Resource],
+      resourceName: String,
+      count: Double): (List[Resource], List[Resource]) = {
+    var remain = count
+    var usedResources = new ArrayBuffer[Resource]
+    val newResources = resources.collect {
+      case r => {
+        if (remain > 0 &&
+          r.getType == Type.SCALAR &&
+          r.getScalar.getValue > 0.0 &&
+          r.getName == resourceName) {
+          val usage = Math.min(remain, r.getScalar.getValue)
+          usedResources += Resource.newBuilder()
+            .setName(resourceName)
+            .setRole(r.getRole)
+            .setType(Value.Type.SCALAR)
+            .setScalar(Value.Scalar.newBuilder().setValue(usage).build())
+            .build()
+          remain -= usage
+          Resource.newBuilder()
+            .setName(resourceName)
+            .setRole(r.getRole)
+            .setType(Value.Type.SCALAR)
+            .setScalar(Value.Scalar.newBuilder().setValue(r.getScalar.getValue - usage).build())
+            .build()
+        } else {
+          r
+        }
+      }
+    }
+
+    (newResources.filter(r => r.getType != Type.SCALAR || r.getScalar.getValue > 0.0).toList,
+      usedResources.toList)
   }
 }
