@@ -22,7 +22,7 @@ import java.util.{List => JList}
 import java.util.Collections
 
 import scala.collection.JavaConversions._
-import scala.collection.mutable.{HashMap, HashSet}
+import scala.collection.mutable.{ArrayBuffer, HashMap, HashSet}
 
 import org.apache.mesos.{Scheduler => MScheduler}
 import org.apache.mesos._
@@ -209,6 +209,7 @@ private[spark] class CoarseMesosSchedulerBackend(
       val filters = Filters.newBuilder().setRefuseSeconds(-1).build()
 
       for (offer <- offers) {
+        logTrace("Offer received from Mesos, id: " + offer.getId + ", offer: " + offer)
         val slaveId = offer.getSlaveId.toString
         val mem = getResource(offer.getResourcesList, "mem")
         val cpus = getResource(offer.getResourcesList, "cpus").toInt
@@ -224,41 +225,32 @@ private[spark] class CoarseMesosSchedulerBackend(
           taskIdToSlaveId(taskId) = slaveId
           slaveIdsWithExecutors += slaveId
           coresByTaskId(taskId) = cpusToUse
-          val task = MesosTaskInfo.newBuilder()
+
+          val (newResources, usedResources) =
+            partitionResources(offer.getResourcesList, "cpus", cpusToUse)
+
+          val taskBuilder = MesosTaskInfo.newBuilder()
             .setTaskId(TaskID.newBuilder().setValue(taskId.toString).build())
             .setSlaveId(offer.getSlaveId)
             .setCommand(createCommand(offer, cpusToUse + extraCoresPerSlave))
             .setName("Task " + taskId)
-            .addResources(createResource("cpus", cpusToUse))
-            .addResources(createResource("mem",
-              MemoryUtils.calculateTotalMemory(sc)))
-            .build()
+            .addAllResources(usedResources)
+            .addAllResources(
+              partitionResources(newResources, "mem", MemoryUtils.calculateTotalMemory(sc))._2)
+
           d.launchTasks(
-            Collections.singleton(offer.getId),  Collections.singletonList(task), filters)
+            Collections.singleton(offer.getId),
+            Collections.singletonList(taskBuilder.build),
+            filters)
+
         } else {
+          logTrace("Offer filtered: " + offer.getId)
           // Filter it out
           d.launchTasks(
             Collections.singleton(offer.getId), Collections.emptyList[MesosTaskInfo](), filters)
         }
       }
     }
-  }
-
-  /** Helper function to pull out a resource from a Mesos Resources protobuf */
-  private def getResource(res: JList[Resource], name: String): Double = {
-    for (r <- res if r.getName == name) {
-      return r.getScalar.getValue
-    }
-    0
-  }
-
-  /** Build a Mesos resource protobuf object */
-  private def createResource(resourceName: String, quantity: Double): Protos.Resource = {
-    Resource.newBuilder()
-      .setName(resourceName)
-      .setType(Value.Type.SCALAR)
-      .setScalar(Value.Scalar.newBuilder().setValue(quantity).build())
-      .build()
   }
 
   /** Check whether a Mesos task state represents a finished task */
